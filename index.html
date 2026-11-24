@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Red Neuronal en Acción</title>
+<style>
+  /* ============================================================
+     CONFIGURACIÓN — cambia aquí colores, velocidad y nodos
+     ============================================================ */
+  :root {
+    --capas: "5,7,7,3";            /* nodos por capa: entrada, ocultas, salida */
+    --velocidad: 1;                /* multiplicador de velocidad de los pulsos */
+    --intervalo-olas: 3800;        /* ms entre oleadas automáticas */
+    --particulas: 70;              /* partículas flotantes del fondo */
+    --flotacion: 7;                /* amplitud de flotación de nodos (px) */
+    --parallax: 26;                /* intensidad del parallax (px) */
+
+    --fondo-centro: #0d1b3d;       /* azul noche */
+    --fondo-borde: #02030a;        /* casi negro */
+    --color-bajo: #3fd0ff;         /* activación baja: cian */
+    --color-medio: #8a5cff;        /* activación media: violeta */
+    --color-alto: #ff3cc8;         /* activación alta: magenta */
+    --color-pico: #ff9a3d;         /* activación máxima: naranja */
+    --texto: #cfe0ff;
+  }
+
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; overflow: hidden; }
+  body {
+    background: radial-gradient(ellipse at 50% 45%, var(--fondo-centro) 0%, var(--fondo-borde) 75%);
+    color: var(--texto);
+    font-family: "Avenir Next", "Segoe UI", system-ui, sans-serif;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; }
+
+  header {
+    position: fixed; top: max(22px, env(safe-area-inset-top)); left: 0; right: 0;
+    text-align: center; pointer-events: none;
+    animation: aparecer 2.2s ease-out both;
+  }
+  h1 { font-size: clamp(.95rem, 1.6vw, 1.2rem); font-weight: 300; letter-spacing: .38em; text-indent: .38em; opacity: .85; }
+  header p { margin-top: 6px; font-size: .72rem; letter-spacing: .12em; opacity: .4; }
+
+  button {
+    position: fixed; bottom: max(26px, env(safe-area-inset-bottom)); left: 50%; transform: translateX(-50%);
+    padding: 11px 26px; border-radius: 999px; cursor: pointer;
+    color: var(--texto); font: inherit; font-size: .85rem; letter-spacing: .08em;
+    background: rgba(120,160,255,.08); border: 1px solid rgba(140,180,255,.28);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    transition: background .3s, box-shadow .3s, transform .2s;
+  }
+  button:hover { background: rgba(138,92,255,.22); box-shadow: 0 0 24px rgba(138,92,255,.45); }
+  button:active { transform: translateX(-50%) scale(.96); }
+  button:focus-visible { outline: 2px solid var(--color-bajo); outline-offset: 3px; }
+
+  @keyframes aparecer { from { opacity: 0; transform: translateY(-8px); } to { opacity: 1; transform: none; } }
+</style>
+</head>
+<body>
+
+<canvas id="lienzo" aria-label="Animación de una red neuronal propagando señales"></canvas>
+<header>
+  <h1>Red Neuronal en Acción</h1>
+  <p>Pasa el ratón sobre un nodo · haz clic para lanzar una señal</p>
+</header>
+<button id="btn" type="button">Lanzar señal</button>
+
+<script>
+(() => {
+  /* ---------- Lectura de variables CSS ---------- */
+  const css = getComputedStyle(document.documentElement);
+  const v = n => css.getPropertyValue(n).trim().replace(/^"|"$/g, '');
+  const CAPAS = v('--capas').split(',').map(Number);
+  const VEL = parseFloat(v('--velocidad'));
+  const INTERVALO = parseFloat(v('--intervalo-olas'));
+  const N_PART = parseInt(v('--particulas'));
+  const FLOT = parseFloat(v('--flotacion'));
+  const PARALLAX = parseFloat(v('--parallax'));
+
+  const hex = h => [1, 3, 5].map(i => parseInt(h.slice(i, i + 2), 16));
+  const RAMPA = [v('--color-bajo'), v('--color-medio'), v('--color-alto'), v('--color-pico')].map(hex);
+  const PARADAS = [0, .4, .75, 1];
+
+  /* Color según intensidad (0..1): interpola entre azul → violeta → magenta → naranja */
+  function color(i) {
+    i = Math.max(0, Math.min(1, i));
+    let k = 0; while (k < 2 && i > PARADAS[k + 1]) k++;
+    const t = (i - PARADAS[k]) / (PARADAS[k + 1] - PARADAS[k]);
+    return RAMPA[k].map((c, j) => c + (RAMPA[k + 1][j] - c) * t);
+  }
+  const rgba = (c, a) => `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+  const rnd = (a, b) => a + Math.random() * (b - a);
+  const clamp = (x, a = 0, b = 1) => Math.max(a, Math.min(b, x));
+
+  /* ---------- Lienzo ---------- */
+  const cv = document.getElementById('lienzo'), ctx = cv.getContext('2d');
+  let W, H, DPR;
+  function ajustar() {
+    DPR = Math.min(devicePixelRatio || 1, 2);
+    W = innerWidth; H = innerHeight;
+    cv.width = W * DPR; cv.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    distribuir();
+  }
+
+  /* ---------- Modelo: nodos y conexiones ---------- */
+  const nodos = [], capas = [], conexiones = [];
+  CAPAS.forEach((n, l) => {
+    capas[l] = [];
+    for (let i = 0; i < n; i++) {
+      const nodo = {
+        l, i, bx: 0, by: 0, x: 0, y: 0, r: 0,
+        z: rnd(-1, 1),                   // profundidad: -1 lejos, 1 cerca
+        fase: rnd(0, 6.28), fv: rnd(.0004, .0009),
+        energia: 0, color: 0, salidas: [], entradas: 0, disparo: 0, sesgo: 1
+      };
+      capas[l].push(nodo); nodos.push(nodo);
+    }
+  });
+  capas.forEach((c, l) => l < capas.length - 1 && c.forEach(a => capas[l + 1].forEach(b => {
+    const cn = { a, b, w: rnd(-1, 1), brillo: 0, color: 0, len: 1 };
+    a.salidas.push(cn); conexiones.push(cn);
+  })));
+
+  /* Posición base de cada nodo según el tamaño de pantalla */
+  function distribuir() {
+    const mx = W * (W < 600 ? .09 : .14), top = H * .2, bot = H * .8;
+    const radio = clamp(Math.min(W / 46, H / 30), 9, 20);
+    capas.forEach((c, l) => c.forEach((n, i) => {
+      n.bx = mx + (W - 2 * mx) * l / (capas.length - 1);
+      n.by = top + (bot - top) * (i + .5) / c.length;
+      n.r = radio * (l === capas.length - 1 ? 1.25 : 1);
+    }));
+  }
+
+  /* ---------- Partículas de fondo ---------- */
+  const particulas = Array.from({ length: N_PART }, () => ({
+    x: Math.random(), y: Math.random(), r: rnd(.4, 1.6),
+    vx: rnd(-.00002, .00002), vy: rnd(-.00005, -.00001), f: rnd(0, 6.28)
+  }));
+
+  /* ---------- Pulsos y oleadas ---------- */
+  const pulsos = [];
+  function emitir(cn, intensidad, retraso) {
+    pulsos.push({ cn, t: 0, i: intensidad, espera: retraso });
+  }
+  function nuevaOla() {
+    capas[capas.length - 1].forEach(n => n.sesgo = rnd(.35, 1.25));  // define el "resultado"
+    capas[0].forEach(n => {
+      const e = rnd(.3, .9);
+      n.energia = Math.max(n.energia, e * .6);
+      n.color = e;
+      n.salidas.forEach(cn => emitir(cn, e, rnd(0, 450)));
+    });
+  }
+  /* Cuando un pulso llega: el nodo destello y, tras un instante, dispara a la siguiente capa */
+  function llegada(p) {
+    const n = p.cn.b, salida = n.l === capas.length - 1;
+    n.energia = Math.min(1.25, n.energia + (salida ? .3 * n.sesgo : .28) * (.5 + Math.abs(p.cn.w)) + p.i * .12);
+    n.color = Math.max(n.color * .6, clamp(n.energia));
+    n.entradas++;
+    if (!salida && !n.disparo) n.disparo = performance.now() + rnd(90, 260);
+  }
+
+  /* ---------- Interacción ---------- */
+  let mx = 0, my = 0, px = 0, py = 0, mouse = { x: -999, y: -999 }, hover = null;
+  addEventListener('pointermove', e => {
+    mx = e.clientX / W - .5; my = e.clientY / H - .5;
+    mouse.x = e.clientX; mouse.y = e.clientY;
+  });
+  addEventListener('pointerleave', () => { mouse.x = mouse.y = -999; });
+  cv.addEventListener('click', nuevaOla);
+  document.getElementById('btn').addEventListener('click', nuevaOla);
+  addEventListener('resize', ajustar);
+
+  /* ---------- Dibujo ---------- */
+  function dibujarEsfera(n, dim) {
+    const prof = (n.z + 1) / 2;                 // 0 lejos … 1 cerca
+    const r = n.r * (.8 + prof * .4);
+    const alfa = (.55 + prof * .45) * dim;
+    const e = clamp(n.energia), col = color(n.color);
+    const base = [14, 28, 64];
+    const mezcla = base.map((b, j) => b + (col[j] - b) * clamp(e * 1.1));
+
+    ctx.save();
+    if ('filter' in ctx) ctx.filter = `blur(${((1 - prof) * 1.6).toFixed(2)}px)`;  // desenfoque en lejanía
+    ctx.globalAlpha = alfa;
+
+    // Resplandor externo
+    if (e > .01 || n === hover) {
+      const g = ctx.createRadialGradient(n.x, n.y, r * .5, n.x, n.y, r * (2.2 + e * 3.2));
+      g.addColorStop(0, rgba(col, .55 * Math.max(e, n === hover ? .35 : 0)));
+      g.addColorStop(1, rgba(col, 0));
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(n.x, n.y, r * (2.2 + e * 3.2), 0, 6.283); ctx.fill();
+      ctx.globalCompositeOperation = 'source-over';
+    }
+    // Volumen: degradado radial desplazado hacia la luz
+    const s = ctx.createRadialGradient(n.x - r * .35, n.y - r * .4, r * .1, n.x, n.y, r);
+    s.addColorStop(0, rgba(mezcla.map(c => Math.min(255, c * 1.9 + 40)), 1));
+    s.addColorStop(.55, rgba(mezcla, 1));
+    s.addColorStop(1, rgba(mezcla.map(c => c * .35), 1));
+    ctx.fillStyle = s; ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, 6.283); ctx.fill();
+
+    // Borde de luz tenue
+    ctx.strokeStyle = rgba(col, .25 + e * .5); ctx.lineWidth = 1; ctx.stroke();
+    // Reflejo especular
+    ctx.fillStyle = `rgba(255,255,255,${.35 + e * .3})`;
+    ctx.beginPath(); ctx.ellipse(n.x - r * .32, n.y - r * .38, r * .28, r * .16, -.7, 0, 6.283); ctx.fill();
+    ctx.restore();
+  }
+
+  let ultimo = performance.now(), proxOla = ultimo + 600;
+
+  function cuadro(ahora) {
+    const dt = Math.min(50, ahora - ultimo); ultimo = ahora;
+    ctx.clearRect(0, 0, W, H);
+
+    // Parallax suavizado
+    px += (mx - px) * .06; py += (my - py) * .06;
+
+    // Posiciones: flotación + parallax según profundidad
+    hover = null; let mejor = 30;
+    nodos.forEach(n => {
+      n.x = n.bx + Math.sin(ahora * n.fv + n.fase) * FLOT * .6 - px * PARALLAX * (n.z + 1.4);
+      n.y = n.by + Math.cos(ahora * n.fv * 1.3 + n.fase) * FLOT - py * PARALLAX * (n.z + 1.4);
+      const d = Math.hypot(n.x - mouse.x, n.y - mouse.y);
+      if (d < Math.max(mejor, n.r + 8) && d <= mejor + n.r) { mejor = d; hover = n; }
+    });
+    cv.style.cursor = hover ? 'pointer' : 'default';
+
+    // Partículas
+    ctx.globalCompositeOperation = 'lighter';
+    particulas.forEach(p => {
+      p.x += p.vx * dt; p.y += p.vy * dt;
+      if (p.y < -.02) p.y = 1.02; if (p.x < -.02) p.x = 1.02; if (p.x > 1.02) p.x = -.02;
+      const a = .15 + .25 * Math.sin(ahora * .001 + p.f);
+      ctx.fillStyle = `rgba(150,190,255,${Math.max(.03, a)})`;
+      ctx.beginPath();
+      ctx.arc(p.x * W - px * 14 * p.r, p.y * H - py * 14 * p.r, p.r, 0, 6.283); ctx.fill();
+    });
+    ctx.globalCompositeOperation = 'source-over';
+
+    // Ola automática (a veces dos seguidas, como una ráfaga de pensamiento)
+    if (ahora > proxOla) { nuevaOla(); proxOla = ahora + INTERVALO * rnd(.7, 1.3); }
+
+    // Conexiones
+    conexiones.forEach(cn => {
+      const A = cn.a, B = cn.b, w = Math.abs(cn.w);
+      const activa = hover && (A === hover || B === hover);
+      const dim = hover ? (activa ? 1 : .18) : 1;
+      cn.brillo *= Math.exp(-dt / 350);
+      ctx.lineWidth = .4 + w * 1.1 + (activa ? .8 : 0);
+      ctx.strokeStyle = `rgba(120,160,255,${((.05 + w * .2) * (activa ? 2.6 : 1) * dim).toFixed(3)})`;
+      ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      if (cn.brillo > .02) {                   // estela de color del pulso reciente
+        ctx.strokeStyle = rgba(color(cn.color), clamp(cn.brillo) * .55 * dim);
+        ctx.lineWidth += .6;
+        ctx.beginPath(); ctx.moveTo(A.x, A.y); ctx.lineTo(B.x, B.y); ctx.stroke();
+      }
+    });
+
+    // Pulsos viajando
+    ctx.globalCompositeOperation = 'lighter';
+    for (let k = pulsos.length - 1; k >= 0; k--) {
+      const p = pulsos[k];
+      if (p.espera > 0) { p.espera -= dt; continue; }
+      const { a, b } = p.cn, len = Math.hypot(b.x - a.x, b.y - a.y);
+      p.t += dt * .42 * VEL / len;
+      if (p.t >= 1) { llegada(p); pulsos.splice(k, 1); continue; }
+      const e = p.t * p.t * (3 - 2 * p.t);       // easing suave
+      const x = a.x + (b.x - a.x) * e, y = a.y + (b.y - a.y) * e;
+      const col = color(p.i + p.t * .15);
+      p.cn.brillo = Math.max(p.cn.brillo, .8); p.cn.color = p.i;
+      const dim = hover ? ((a === hover || b === hover) ? 1 : .3) : 1;
+      // estela
+      const e0 = Math.max(0, e - .12), x0 = a.x + (b.x - a.x) * e0, y0 = a.y + (b.y - a.y) * e0;
+      const lg = ctx.createLinearGradient(x0, y0, x, y);
+      lg.addColorStop(0, rgba(col, 0)); lg.addColorStop(1, rgba(col, .9 * dim));
+      ctx.strokeStyle = lg; ctx.lineWidth = 1.8; ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x, y); ctx.stroke();
+      // cabeza luminosa
+      const g = ctx.createRadialGradient(x, y, 0, x, y, 9);
+      g.addColorStop(0, `rgba(255,255,255,${.95 * dim})`); g.addColorStop(.25, rgba(col, .7 * dim)); g.addColorStop(1, rgba(col, 0));
+      ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 9, 0, 6.283); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    // Nodos: disparo hacia la siguiente capa y decaimiento gradual
+    nodos.forEach(n => {
+      if (n.disparo && ahora >= n.disparo) {
+        n.disparo = 0;
+        const inten = clamp(.2 + n.energia * .65);
+        n.salidas.forEach(cn => emitir(cn, inten * (.55 + Math.abs(cn.w) * .45), rnd(0, 300)));
+        n.entradas = 0;
+      }
+      n.energia *= Math.exp(-dt / (n.l === capas.length - 1 ? 1400 : 650));
+    });
+    // Se dibujan de lejos a cerca para respetar la profundidad
+    [...nodos].sort((a, b) => a.z - b.z).forEach(n => dibujarEsfera(n, hover && n !== hover ? .55 : 1));
+
+    requestAnimationFrame(cuadro);
+  }
+
+  ajustar();
+  requestAnimationFrame(cuadro);
+})();
+</script>
+</body>
+</html>
